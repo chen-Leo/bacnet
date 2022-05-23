@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -277,6 +278,8 @@ func (c *Client) ReadProperty(ctx context.Context, device bacnet.Device, readPro
 	}
 	select {
 	case apdu := <-rChan:
+		log.Printf("%v\n", apdu)
+		log.Printf("type: %v ,serviceType: %v", apdu.DataType, apdu.ServiceType)
 		//Todo: ensure response validity, ensure conversion cannot panic
 		if apdu.DataType == Error {
 			return nil, *apdu.Payload.(*ApduError)
@@ -322,6 +325,8 @@ func (c *Client) WriteProperty(ctx context.Context, device bacnet.Device, writeP
 
 	select {
 	case apdu := <-wrChan:
+		log.Printf("%v\n", apdu)
+		log.Printf("type: %v ,serviceType: %v", apdu.DataType, apdu.ServiceType)
 		//Todo: ensure response validity, ensure conversion cannot panic
 		if apdu.DataType == Error {
 			return *apdu.Payload.(*ApduError)
