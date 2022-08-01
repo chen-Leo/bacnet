@@ -15,7 +15,7 @@ import (
 
 type Client struct {
 	//Maybe change to bacnet address
-	ipAdress         net.IP
+	ipAddress        net.IP
 	broadcastAddress net.IP
 	udpPort          int
 	udp              *net.UDPConn
@@ -63,32 +63,51 @@ func NewClient(netInterface string, port int) (*Client, error) {
 		port = DefaultUDPPort
 	}
 	c.udpPort = port
-	addrs, err := i.Addrs()
+	adders, err := i.Addrs()
 	if err != nil {
 		return nil, err
 	}
-	if len(addrs) == 0 {
+	if len(adders) == 0 {
 		return nil, fmt.Errorf("interface %s has no addresses", netInterface)
 	}
-	for _, adr := range addrs {
-		ip, ipnet, err := net.ParseCIDR(adr.String())
+
+	for _, adr := range adders {
+		ip, ipNet, err := net.ParseCIDR(adr.String())
 		if err != nil {
 			return nil, err
 		}
 		// To4 is nil when type is ip6
 		if ip.To4() != nil {
-			broadcast, err := broadcastAddr(ipnet)
+			broadcast, err := broadcastAddr(ipNet)
 			if err != nil {
 				return nil, err
 			}
-			c.ipAdress = ip.To4()
+			c.ipAddress = ip.To4()
 			c.broadcastAddress = broadcast
 			break
 		}
 	}
-	if c.ipAdress == nil {
-		return nil, fmt.Errorf("no IPv4 address assigned to interface %s", netInterface)
+
+	if c.ipAddress == nil {
+		return nil, fmt.Errorf("no IPv4 address assigned to interface ")
 	}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: c.udpPort,
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.udp = conn
+	go c.listen()
+	return c, nil
+}
+
+//NewClientNoNetInterface 创建一个bacnet client，使用默认的47808端口，监听0.0.0.0:47808的bacnet消息,未指定发送消息时的IpAddress,broadcastAddress
+func NewClientNoNetInterface() (*Client, error) {
+	c := &Client{subscriptions: &Subscriptions{}, transactions: NewTransactions(), Logger: NoOpLogger{}}
+	c.udpPort = DefaultUDPPort
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
@@ -247,6 +266,22 @@ func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, erro
 	}
 }
 
+//WhoIsWithNetInterface 向指定网卡发送WhoIs消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+func (c *Client) WhoIsWithNetInterface(ip net.IP, ipNet *net.IPNet, data WhoIs, timeout time.Duration) ([]bacnet.Device, error) {
+	// To4 is nil when type is ip6
+	if ip.To4() != nil {
+		broadcast, err := broadcastAddr(ipNet)
+		if err != nil {
+			return nil, err
+		}
+		c.ipAddress = ip.To4()
+		c.broadcastAddress = broadcast
+	} else {
+		return nil, fmt.Errorf("no IPv4 address assigned to interface ")
+	}
+	return c.WhoIs(data, timeout)
+}
+
 func (c *Client) ReadProperty(ctx context.Context, device bacnet.Device, readProp ReadProperty) (interface{}, error) {
 	invokeID := c.transactions.GetID()
 	defer c.transactions.FreeID(invokeID)
@@ -257,7 +292,7 @@ func (c *Client) ReadProperty(ctx context.Context, device bacnet.Device, readPro
 		Priority:              Normal,
 		Destination:           &device.Addr,
 		Source: bacnet.AddressFromUDP(net.UDPAddr{
-			IP:   c.ipAdress,
+			IP:   c.ipAddress,
 			Port: c.udpPort,
 		}),
 		HopCount: 255,
@@ -291,6 +326,22 @@ func (c *Client) ReadProperty(ctx context.Context, device bacnet.Device, readPro
 	}
 }
 
+//ReadPropertyWithNetInterface 向指定网卡发送read消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+func (c *Client) ReadPropertyWithNetInterface(ip net.IP, ipNet *net.IPNet, ctx context.Context, device bacnet.Device, readProp ReadProperty) (interface{}, error) {
+	// To4 is nil when type is ip6
+	if ip.To4() != nil {
+		broadcast, err := broadcastAddr(ipNet)
+		if err != nil {
+			return nil, err
+		}
+		c.ipAddress = ip.To4()
+		c.broadcastAddress = broadcast
+	} else {
+		return nil, fmt.Errorf("no IPv4 address assigned to interface ")
+	}
+	return c.ReadProperty(ctx, device, readProp)
+}
+
 func (c *Client) WriteProperty(ctx context.Context, device bacnet.Device, writeProp WriteProperty) error {
 	invokeID := c.transactions.GetID()
 	defer c.transactions.FreeID(invokeID)
@@ -301,7 +352,7 @@ func (c *Client) WriteProperty(ctx context.Context, device bacnet.Device, writeP
 		Priority:              Normal,
 		Destination:           &device.Addr,
 		Source: bacnet.AddressFromUDP(net.UDPAddr{
-			IP:   c.ipAdress,
+			IP:   c.ipAddress,
 			Port: c.udpPort,
 		}),
 		HopCount: 255,
@@ -334,6 +385,22 @@ func (c *Client) WriteProperty(ctx context.Context, device bacnet.Device, writeP
 		return ctx.Err()
 	}
 
+}
+
+//WritePropertyWithNetInterface 向指定网卡发送write消息，传入的adr形如"192.0.2.0/24"形式，Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+func (c *Client) WritePropertyWithNetInterface(ip net.IP, ipNet *net.IPNet, ctx context.Context, device bacnet.Device, writeProp WriteProperty) error {
+	// To4 is nil when type is ip6
+	if ip.To4() != nil {
+		broadcast, err := broadcastAddr(ipNet)
+		if err != nil {
+			return err
+		}
+		c.ipAddress = ip.To4()
+		c.broadcastAddress = broadcast
+	} else {
+		return fmt.Errorf("no IPv4 address assigned to interface ")
+	}
+	return c.WriteProperty(ctx, device, writeProp)
 }
 
 func (c *Client) send(npdu NPDU) (int, error) {
