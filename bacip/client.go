@@ -173,7 +173,6 @@ func (c *Client) handleMessage(src *net.UDPAddr, b []byte) error {
 		case <-tx.Ctx.Done():
 			return fmt.Errorf("handler for tx %d: %w", invokeID, tx.Ctx.Err())
 		}
-
 	}
 	return nil
 }
@@ -244,6 +243,7 @@ func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, erro
 					if !ok {
 						return nil, fmt.Errorf("unexpected payload type %T", apdu.Payload)
 					}
+					//fmt.Printf("id  %v\n", iam.ObjectID.Instance)
 					//Only add result that we are interested in. Well
 					//behaved devices should not answer if their
 					//InstanceID isn't in the given range. But because
@@ -253,13 +253,20 @@ func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, erro
 						if iam.ObjectID.Instance >= bacnet.ObjectInstance(*data.Low) &&
 							iam.ObjectID.Instance <= bacnet.ObjectInstance(*data.High) {
 							addr := bacnet.AddressFromUDP(r.src)
+							if r.bvlc.NPDU.Source != nil {
+								addr.Net = r.bvlc.NPDU.Source.Net
+								addr.Adr = r.bvlc.NPDU.Source.Adr
+							}
 							set[*iam] = *addr
 						}
 					} else {
 						addr := bacnet.AddressFromUDP(r.src)
+						if r.bvlc.NPDU.Source != nil {
+							addr.Net = r.bvlc.NPDU.Source.Net
+							addr.Adr = r.bvlc.NPDU.Source.Adr
+						}
 						set[*iam] = *addr
 					}
-
 				}
 			}
 		}
