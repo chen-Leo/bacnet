@@ -1,4 +1,4 @@
-//Package bacip implements a Bacnet/IP client
+// Package bacip implements a Bacnet/IP client
 package bacip
 
 import (
@@ -14,14 +14,15 @@ import (
 )
 
 type Client struct {
-	//Maybe change to bacnet address
-	ipAddress        net.IP
-	broadcastAddress net.IP
-	udpPort          int
+	ipAddress        net.IP //bacnet broadcast message source ip address
+	broadcastAddress net.IP //use this broadcast address to send bacnet messages
+	udpPort          int    //bacnet message udp listening port
 	udp              *net.UDPConn
 	subscriptions    *Subscriptions
 	transactions     *Transactions
 	Logger           Logger
+
+	stopSign chan bool //stop the listen sign chan
 }
 
 type Logger interface {
@@ -50,11 +51,13 @@ func broadcastAddr(n *net.IPNet) (net.IP, error) {
 	return ip, nil
 }
 
-//NewClient creates a new bacnet client. It binds on the given port
-//and network interface (eth0 for example). If Port if 0, the default
-//bacnet port is used
+// NewClient creates a new bacnet client. It binds on the given port
+// and network interface (eth0 for example). If Port is 0, the default
+// bacnet port (47808) is used
 func NewClient(netInterface string, port int) (*Client, error) {
 	c := &Client{subscriptions: &Subscriptions{}, transactions: NewTransactions(), Logger: NoOpLogger{}}
+
+	//Set the broadcast Address and source IP address of the bacnet broadcast message through the netInterface name
 	i, err := net.InterfaceByName(netInterface)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", netInterface, err)
@@ -71,6 +74,7 @@ func NewClient(netInterface string, port int) (*Client, error) {
 		return nil, fmt.Errorf("interface %s has no addresses", netInterface)
 	}
 
+	// todo .....................
 	for _, adr := range adders {
 		ip, ipNet, err := net.ParseCIDR(adr.String())
 		if err != nil {
@@ -87,27 +91,37 @@ func NewClient(netInterface string, port int) (*Client, error) {
 			break
 		}
 	}
-
 	if c.ipAddress == nil {
 		return nil, fmt.Errorf("no IPv4 address assigned to interface ")
 	}
 
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
+	//Establish an udp connection and listen to bacnet messages
+	if port == 0 {
+		port = DefaultUDPPort
+	}
+	c.udpPort = port
+	c.udp, err = net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: c.udpPort,
 	})
 	if err != nil {
 		return nil, err
 	}
-	c.udp = conn
+
 	go c.listen()
 	return c, nil
 }
 
-//NewClientNoNetInterface 创建一个bacnet client，使用默认的47808端口，监听0.0.0.0:47808的bacnet消息,未指定发送消息时的IpAddress,broadcastAddress
-func NewClientNoNetInterface() (*Client, error) {
+// NewClientNoNetInterface
+// create a new bacnet client, use the default port 47808, listen to bacnet messages at 0.0.0.0:47808
+// and do not specify the IpAddress and broadcastAddress when sending messages
+func NewClientNoNetInterface(port int) (*Client, error) {
 	c := &Client{subscriptions: &Subscriptions{}, transactions: NewTransactions(), Logger: NoOpLogger{}}
-	c.udpPort = DefaultUDPPort
+	if port > 0 {
+		c.udpPort = port
+	} else {
+		c.udpPort = DefaultUDPPort
+	}
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
@@ -121,60 +135,12 @@ func NewClientNoNetInterface() (*Client, error) {
 	return c, nil
 }
 
-// listen for incoming bacnet packets.
-func (c *Client) listen() {
-	//Todo: allow close client
-	for {
-		b := make([]byte, 2048)
-		i, addr, err := c.udp.ReadFromUDP(b)
-		if err != nil {
-			c.Logger.Error(err.Error())
-		}
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					c.Logger.Error("panic in handle message: ", r)
-				}
-			}()
-			err := c.handleMessage(addr, b[:i])
-			if err != nil {
-				c.Logger.Error("handle msg: ", err)
-			}
-		}()
+// StopListen
+// stop listen for incoming bacnet packets.
+func (c *Client) StopListen() {
+	if c.stopSign != nil {
+		c.stopSign <- false
 	}
-}
-
-func (c *Client) handleMessage(src *net.UDPAddr, b []byte) error {
-	var bvlc BVLC
-	err := bvlc.UnmarshalBinary(b)
-	if err != nil && errors.Is(err, ErrNotBAcnetIP) {
-		return err
-	}
-	apdu := bvlc.NPDU.ADPU
-	if apdu == nil {
-		c.Logger.Info(fmt.Sprintf("Received network packet %+v", bvlc.NPDU))
-		return nil
-	}
-	c.subscriptions.RLock()
-	if c.subscriptions.f != nil {
-		//If f block, there is a deadlock here
-		c.subscriptions.f(bvlc, *src)
-	}
-	c.subscriptions.RUnlock()
-	if apdu.DataType == ComplexAck || apdu.DataType == SimpleAck || apdu.DataType == Error {
-		invokeID := bvlc.NPDU.ADPU.InvokeID
-		tx, ok := c.transactions.GetTransaction(invokeID)
-		if !ok {
-			return fmt.Errorf("no transaction found for id %d", invokeID)
-		}
-		select {
-		case tx.APDU <- *apdu:
-			return nil
-		case <-tx.Ctx.Done():
-			return fmt.Errorf("handler for tx %d: %w", invokeID, tx.Ctx.Err())
-		}
-	}
-	return nil
 }
 
 func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, error) {
@@ -218,11 +184,12 @@ func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, erro
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	//Use a set to deduplicate results
-	set := map[Iam]bacnet.Address{}
+
+	set := map[Iam]bacnet.Address{} //接受返回消息
 	for {
 		select {
 		case <-timer.C:
-			result := []bacnet.Device{}
+			var result []bacnet.Device
 			for iam, addr := range set {
 				result = append(result, bacnet.Device{
 					ID:           iam.ObjectID,
@@ -273,7 +240,7 @@ func (c *Client) WhoIs(data WhoIs, timeout time.Duration) ([]bacnet.Device, erro
 	}
 }
 
-//WhoIsWithNetInterface 向指定网卡发送WhoIs消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+// WhoIsWithNetInterface 向指定网卡发送WhoIs消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
 func (c *Client) WhoIsWithNetInterface(ip net.IP, ipNet *net.IPNet, data WhoIs, timeout time.Duration) ([]bacnet.Device, error) {
 	// To4 is nil when type is ip6
 	if ip.To4() != nil {
@@ -333,7 +300,7 @@ func (c *Client) ReadProperty(ctx context.Context, device bacnet.Device, readPro
 	}
 }
 
-//ReadPropertyWithNetInterface 向指定网卡发送read消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+// ReadPropertyWithNetInterface 向指定网卡发送read消息，传入的adr形如"192.0.2.0/24"形式,Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
 func (c *Client) ReadPropertyWithNetInterface(ip net.IP, ipNet *net.IPNet, ctx context.Context, device bacnet.Device, readProp ReadProperty) (interface{}, error) {
 	// To4 is nil when type is ip6
 	if ip.To4() != nil {
@@ -394,7 +361,7 @@ func (c *Client) WriteProperty(ctx context.Context, device bacnet.Device, writeP
 
 }
 
-//WritePropertyWithNetInterface 向指定网卡发送write消息，传入的adr形如"192.0.2.0/24"形式，Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
+// WritePropertyWithNetInterface 向指定网卡发送write消息，传入的adr形如"192.0.2.0/24"形式，Client的默认IpAddress，BroadcastAddress会变成指定网卡的ip及broadcast
 func (c *Client) WritePropertyWithNetInterface(ip net.IP, ipNet *net.IPNet, ctx context.Context, device bacnet.Device, writeProp WriteProperty) error {
 	// To4 is nil when type is ip6
 	if ip.To4() != nil {
@@ -408,6 +375,70 @@ func (c *Client) WritePropertyWithNetInterface(ip net.IP, ipNet *net.IPNet, ctx 
 		return fmt.Errorf("no IPv4 address assigned to interface ")
 	}
 	return c.WriteProperty(ctx, device, writeProp)
+}
+
+// listen for incoming bacnet packets.
+// Exit the function when a message is received from the stopSign, don't care what the message is
+func (c *Client) listen() {
+	c.stopSign = make(chan bool)
+	for {
+		select {
+		case <-c.stopSign:
+			c.stopSign = nil
+			return
+		default:
+			b := make([]byte, 2048)
+			i, addr, err := c.udp.ReadFromUDP(b)
+			if err != nil {
+				c.Logger.Error(err.Error())
+			}
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						c.Logger.Error("panic in handle message: ", r)
+					}
+				}()
+				err := c.handleMessage(addr, b[:i])
+				if err != nil {
+					c.Logger.Error("handle msg: ", err)
+				}
+			}()
+		}
+	}
+}
+
+// handleMessage
+func (c *Client) handleMessage(src *net.UDPAddr, b []byte) error {
+	var bvlc BVLC
+	err := bvlc.UnmarshalBinary(b)
+	if err != nil && errors.Is(err, ErrNotBAcnetIP) {
+		return err
+	}
+	apdu := bvlc.NPDU.ADPU
+	if apdu == nil {
+		c.Logger.Info(fmt.Sprintf("Received network packet %+v", bvlc.NPDU))
+		return nil
+	}
+	c.subscriptions.RLock()
+	if c.subscriptions.f != nil {
+		//If f block, there is a deadlock here
+		c.subscriptions.f(bvlc, *src)
+	}
+	c.subscriptions.RUnlock()
+	if apdu.DataType == ComplexAck || apdu.DataType == SimpleAck || apdu.DataType == Error {
+		invokeID := bvlc.NPDU.ADPU.InvokeID
+		tx, ok := c.transactions.GetTransaction(invokeID)
+		if !ok {
+			return fmt.Errorf("no transaction found for id %d", invokeID)
+		}
+		select {
+		case tx.APDU <- *apdu:
+			return nil
+		case <-tx.Ctx.Done():
+			return fmt.Errorf("handler for tx %d: %w", invokeID, tx.Ctx.Err())
+		}
+	}
+	return nil
 }
 
 func (c *Client) send(npdu NPDU) (int, error) {
@@ -439,6 +470,6 @@ func (c *Client) broadcast(npdu NPDU) (int, error) {
 	}
 	return c.udp.WriteToUDP(bytes, &net.UDPAddr{
 		IP:   c.broadcastAddress,
-		Port: DefaultUDPPort,
+		Port: c.udpPort,
 	})
 }
